@@ -7,6 +7,7 @@ COPY lionwheel_mcp.py .
 
 ENV TRANSPORT=http
 ENV PORT=8000
+ENV PYTHONUNBUFFERED=1
 EXPOSE 8000
 
 CMD ["python", "lionwheel_mcp.py"]

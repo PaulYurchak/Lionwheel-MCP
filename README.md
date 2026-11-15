@@ -4,21 +4,48 @@ Gives Claude read/write access to your [LionWheel](https://www.lionwheel.com)
 delivery operations by wrapping the LionWheel REST API
 (https://github.com/lionwheel/api) as MCP tools.
 
-## Tools exposed
+## Tools exposed (53)
 
+**Deliveries (tasks)**
 | Tool | What it does |
 |------|--------------|
-| `create_delivery` | Create a delivery (task) |
-| `get_delivery` | Fetch a task by id (status, driver, etc.) |
-| `update_delivery` | Reassign driver, change date, or set status |
-| `get_tasks_by_order_id` | Look up tasks by your external order id |
-| `get_tasks_by_phone` | Look up tasks by recipient phone |
-| `add_document` | Attach a base64 PDF/PNG/JPEG to a task |
-| `get_daily_route` | A driver's route for a date |
-| `optimize_daily_route` | Optimize a driver's route for a date |
-| `list_routes` | List routes for a date |
-| `get_visit` / `update_visit` | Read / update a visit |
-| `get_company` / `create_company` / `update_company` | Manage companies |
+| `create_delivery` | Create a delivery with any documented field (COD, time window, line items, documents, coordinates, gift fields…) |
+| `create_simple_delivery` | Create a delivery from just the essentials (cash amount in normal units) |
+| `get_delivery` / `get_delivery_status` | Full record / short human-readable status |
+| `update_delivery` | Change driver, date and/or status (status by name or number) |
+| `set_delivery_status` | Set status by name: `completed`, `failed`, `canceled`… |
+| `assign_driver` / `unassign_driver` | Assign or return to the unassigned pool |
+| `cancel_delivery`, `mark_delivery_completed`, `mark_delivery_failed`, `mark_delivery_active`, `mark_roundtrip_delivered` | One-step status changes |
+| `reschedule_delivery` | Move to another date |
+| `get_tasks_by_order_id` / `track_order` | Look up by external order id (raw / with status summary) |
+| `get_tasks_by_phone` / `get_deliveries_by_phone_summary` | Look up by recipient phone |
+| `add_document` / `add_document_from_url` | Attach a PDF/PNG/JPEG (base64 or download from a URL) |
+
+**Bulk** (up to 200 items per call)
+`bulk_create_deliveries`, `bulk_get_deliveries`, `bulk_update_deliveries`, `bulk_assign_driver`,
+`bulk_reschedule_deliveries`, `bulk_cancel_deliveries`, `bulk_track_orders`, `bulk_get_visits`,
+`bulk_update_visits`, `bulk_get_companies`
+
+**Drivers & routes**
+`get_daily_route`, `get_driver_route_summary` (completed vs remaining), `get_daily_routes_for_drivers`,
+`optimize_daily_route`, `optimize_routes_for_drivers`, `list_routes`, `get_routes_summary`
+(whole-day status breakdown), `get_routes_for_date_range`
+
+**Visits**
+`get_visit`, `update_visit`, `reassign_visit`, `reschedule_visit`
+
+**Companies (customers)**
+`get_company`, `create_company`, `update_company`, `activate_company`, `deactivate_company`,
+`update_company_default_location`, `update_company_time_window`
+
+**Utility**
+`get_reference_codes`, `get_server_info`, `check_connection`, `lionwheel_api_request`
+(raw call to any `/api/v1` endpoint)
+
+**Prompts:** `daily_operations_report`, `customer_order_lookup`, `driver_day_review`
+
+Dates can be given as `dd/mm/yyyy`, `yyyy-mm-dd`, `today`, `tomorrow`, `yesterday` or `+N`/`-N`.
+Statuses can be given by name or number; responses get an extra `status_name` field.
 
 The LionWheel API key lives **only** on the server (env var). Claude never sees it.
 
@@ -41,7 +68,7 @@ To test safely first, request sandbox access from support@lionwheel.com and poin
 ### Option A — Local, for Claude Desktop (stdio)
 
 ```bash
-pip install -r requirements.txt
+pip install -r requirements.txt   # pins mcp<2 (FastMCP API)
 export LIONWHEEL_API_KEY="your_token"
 # export LIONWHEEL_COMPANY_ID="12345"   # only for shipping-company tokens
 python lionwheel_mcp.py
@@ -109,10 +136,17 @@ public, unauthenticated MCP URL means anyone who finds it can do the same.
 - Custom connectors link Claude to a service Anthropic hasn't verified — you are
   trusting this code and your own deployment.
 
-> Note: `MCP_BEARER_TOKEN` is read by the entrypoint as a flag; enforcing it
-> requires wrapping the ASGI app with an auth check or fronting it with a proxy.
-> The simplest production-grade path is an auth proxy / API gateway in front of
-> the container. See the security section above.
+`MCP_BEARER_TOKEN` is enforced in HTTP mode. Send it as `Authorization: Bearer <token>`,
+or (for claude.ai custom connectors, which can't add headers) put it in the URL:
+`https://your-app.up.railway.app/mcp?token=<token>`. `/health` is always open for health checks.
+Set `LIONWHEEL_READ_ONLY=true` to block every write call.
+
+## Deploying on Railway
+
+The repo includes `railway.json` (Dockerfile build + `/health` check). Create a service from
+this GitHub repo, set the variables `LIONWHEEL_API_KEY`, `MCP_BEARER_TOKEN` (and optionally
+`LIONWHEEL_COMPANY_ID`, `LIONWHEEL_BASE_URL`, `LIONWHEEL_TIMEZONE`), generate a domain, and add
+`https://<domain>/mcp?token=<MCP_BEARER_TOKEN>` as a custom connector in Claude.
 
 ---
 
