@@ -1121,6 +1121,8 @@ if __name__ == "__main__":
         if not BEARER_TOKEN:
             print("WARNING: MCP_BEARER_TOKEN is not set — the /mcp endpoint is public!")
         uvicorn.run(build_http_app(), host="0.0.0.0", port=port, proxy_headers=True,
-                    forwarded_allow_ips="*")
+                    forwarded_allow_ips="*",
+                    # Access logs include the full URL, i.e. ?token=<MCP_BEARER_TOKEN>.
+                    access_log=False)
     else:
         mcp.run(transport="stdio")
