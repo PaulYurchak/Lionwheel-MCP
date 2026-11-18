@@ -689,9 +689,44 @@ _STOP_FIELDS = (
 )
 
 
+def _stop_from_daily_route(v: dict) -> dict:
+    """drivers/<id>/daily_route returns bare stops with the task nested; map them to
+    the same shape as the visits inside /routes."""
+    task = v.get("task") if isinstance(v.get("task"), dict) else {}
+    st = str(task.get("status") or v.get("status_name") or "UNKNOWN").upper()
+    addr = v.get("location_partial_address") or ", ".join(
+        x for x in (v.get("partial_address_no_city"), v.get("city")) if x
+    )
+    return {
+        "id": v.get("visit_id"),
+        "task_id": task.get("id"),
+        "kind": v.get("kind"),
+        "task_status": st,
+        "is_done": st in ("COMPLETED", "ROUNDTRIP_DELIVERED"),
+        "recipient_name": v.get("recipient_name") or task.get("destination_recipient_name"),
+        "phone": task.get("destination_phone"),
+        "partial_address": addr,
+        "company_name": v.get("company_name"),
+        "eta_at_formatted": v.get("eta_at"),
+        "failure_reason": task.get("failure_reason"),
+        "wp_order_id": task.get("wp_order_id"),
+        "visit_notes": v.get("visit_notes"),
+    }
+
+
 def _routes_from(data: Any) -> list[dict]:
     if isinstance(data, list):
-        return [r for r in data if isinstance(r, dict)]
+        items = [r for r in data if isinstance(r, dict)]
+        if items and "visits" not in items[0] and ("visit_id" in items[0] or "task" in items[0]):
+            first = items[0]
+            return [{
+                "driver_id": first.get("driver_id"),
+                "driver_str": first.get("driver_name"),
+                "date": first.get("visit_at"),
+                "visits": [dict(_stop_from_daily_route(v), daily_order=i + 1)
+                           for i, v in enumerate(items)],
+            }]
+        return items
     if isinstance(data, dict):
         for key in ("routes", "route", "data"):
             if key in data:
@@ -732,7 +767,8 @@ def _route_summary(r: dict, include_stops: bool) -> dict:
         "packages": r.get("packages"),
         "stops": len(visits),
         "done": done,
-        "remaining": len(visits) - done,
+        "remaining": sum(1 for v in visits if not v.get("is_done") and str(
+            v.get("task_status", "")).upper() not in ("FAILED", "FINAL_FAILED", "CANCELED")),
         "by_status": by_status,
         "by_kind": by_kind,
         "late_stops": sum(1 for v in visits if v.get("late_days")),
