@@ -1085,6 +1085,10 @@ class _AuthAndHealth:
             return await self._send_json(
                 send, 200, b'{"status":"ok","service":"lionwheel-mcp","mcp_path":"/mcp"}'
             )
+        # No OAuth here: tell clients so (404) instead of 401, so they fall back to the
+        # ?token= / bearer-token URL rather than trying to start a login flow.
+        if path.startswith("/.well-known/") or path in ("/register", "/authorize", "/token"):
+            return await self._send_json(send, 404, b'{"error":"not found"}')
         if self.token:
             supplied = ""
             for k, v in scope.get("headers", []):
