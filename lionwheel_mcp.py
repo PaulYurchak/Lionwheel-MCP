@@ -195,6 +195,9 @@ def _collect_statuses(obj: Any, acc: dict[str, int]) -> None:
         if isinstance(st, int) and st in STATUS_CODES:
             name = STATUS_CODES[st]
             acc[name] = acc.get(name, 0) + 1
+        elif isinstance(obj.get("task_status"), str):
+            name = obj["task_status"].upper()
+            acc[name] = acc.get(name, 0) + 1
         for v in obj.values():
             _collect_statuses(v, acc)
     elif isinstance(obj, list):
@@ -675,81 +678,174 @@ async def bulk_track_orders(order_ids: list[str]) -> dict:
 # Drivers / routes
 # --------------------------------------------------------------------------- #
 
-@mcp.tool()
-async def get_daily_route(driver_id: int, date: Optional[str] = None) -> dict:
-    """Get a driver's route for a date (defaults to today)."""
+# Route payloads are big (an encoded map polyline plus ~50 fields per stop), so the
+# route tools return a compact view by default. Pass full=True for the raw response.
+
+_STOP_FIELDS = (
+    "id", "task_id", "daily_order", "kind", "task_status", "is_done", "recipient_name",
+    "phone", "partial_address", "company_name", "company_id", "eta_at_formatted",
+    "eta_window", "earliest_latest_time", "packages_quantity", "late_days",
+    "failure_reason", "wp_order_id", "visit_notes",
+)
+
+
+def _routes_from(data: Any) -> list[dict]:
+    if isinstance(data, list):
+        return [r for r in data if isinstance(r, dict)]
+    if isinstance(data, dict):
+        for key in ("routes", "route", "data"):
+            if key in data:
+                return _routes_from(data[key])
+        if "visits" in data:
+            return [data]
+    return []
+
+
+def _compact_stop(v: dict) -> dict:
+    return {k: v[k] for k in _STOP_FIELDS if v.get(k) not in (None, "", [], {})}
+
+
+def _route_summary(r: dict, include_stops: bool) -> dict:
+    visits = [v for v in (r.get("visits") or []) if isinstance(v, dict)]
+    by_status: dict[str, int] = {}
+    by_kind: dict[str, int] = {}
+    for v in visits:
+        st = str(v.get("task_status") or "UNKNOWN")
+        by_status[st] = by_status.get(st, 0) + 1
+        kind = str(v.get("kind") or "UNKNOWN")
+        by_kind[kind] = by_kind.get(kind, 0) + 1
+    done = sum(1 for v in visits if v.get("is_done"))
+    out = _clean({
+        "route_id": r.get("id"),
+        "name": r.get("name"),
+        "date": r.get("date"),
+        "driver_id": r.get("driver_id"),
+        "driver": r.get("driver_str"),
+        "vehicle": r.get("vehicle_str"),
+        "route_status": r.get("status"),
+        "is_locked": r.get("is_locked"),
+        "start_time": r.get("start_time"),
+        "end_eta": r.get("end_eta_at"),
+        "distance": r.get("distance"),
+        "start_address": r.get("start_point_address"),
+        "finish_address": r.get("finish_point_address"),
+        "packages": r.get("packages"),
+        "stops": len(visits),
+        "done": done,
+        "remaining": len(visits) - done,
+        "by_status": by_status,
+        "by_kind": by_kind,
+        "late_stops": sum(1 for v in visits if v.get("late_days")),
+        "failed_stops": [_compact_stop(v) for v in visits
+                         if v.get("failure_reason") or v.get("task_status") in ("FAILED", "FINAL_FAILED")],
+    })
+    if include_stops:
+        out["stop_list"] = [_compact_stop(v) for v in visits]
+    return out
+
+
+def _routes_overview(res: dict, include_stops: bool) -> dict:
+    if not res.get("ok"):
+        return res
+    routes = _routes_from(res.get("data"))
+    summaries = [_route_summary(r, include_stops) for r in routes]
+    totals: dict[str, int] = {}
+    for sm in summaries:
+        for k, n in sm.get("by_status", {}).items():
+            totals[k] = totals.get(k, 0) + n
+    return {
+        "ok": True,
+        "route_count": len(summaries),
+        "total_stops": sum(sm.get("stops", 0) for sm in summaries),
+        "total_done": sum(sm.get("done", 0) for sm in summaries),
+        "total_packages": sum(sm.get("packages") or 0 for sm in summaries),
+        "status_totals": totals,
+        "routes": summaries,
+    }
+
+
+async def _fetch_routes(date: Optional[str]) -> dict:
+    return await _request("GET", "routes", params={"date": _date(date), "format": "json"})
+
+
+async def _fetch_driver_route(driver_id: int, date: Optional[str]) -> dict:
     return await _request(
         "GET", f"drivers/{driver_id}/daily_route", params={"date": _date(date)}
     )
 
 
 @mcp.tool()
+async def get_daily_route(driver_id: int, date: Optional[str] = None, full: bool = False) -> dict:
+    """Get a driver's route for a date (defaults to today): route info plus a compact
+    list of stops in order. full=True returns LionWheel's raw (very large) response."""
+    res = await _fetch_driver_route(driver_id, date)
+    if full or not res.get("ok") or not _routes_from(res.get("data")):
+        return res
+    return _routes_overview(res, include_stops=True)
+
+
+@mcp.tool()
 async def get_driver_route_summary(driver_id: int, date: Optional[str] = None) -> dict:
-    """Summarize a driver's day: number of stops and a breakdown by status
-    (e.g. how many COMPLETED vs still ASSIGNED). Includes the raw route."""
-    res = await get_daily_route(driver_id=driver_id, date=date)
-    if res.get("ok"):
-        counts: dict[str, int] = {}
-        _collect_statuses(res.get("data"), counts)
-        res["status_summary"] = counts
-        res["total_with_status"] = sum(counts.values())
-        done = counts.get("COMPLETED", 0) + counts.get("ROUNDTRIP_DELIVERED", 0)
-        res["completed"] = done
-        res["remaining"] = sum(
-            n for s, n in counts.items() if s in ("UNASSIGNED", "ASSIGNED", "ACTIVE")
-        )
-    return res
+    """Summarize a driver's day without listing every stop: stops done vs remaining,
+    breakdown by status and kind (delivery/pickup), late and failed stops."""
+    res = await _fetch_driver_route(driver_id, date)
+    if not res.get("ok") or not _routes_from(res.get("data")):
+        return res
+    return _routes_overview(res, include_stops=False)
 
 
 @mcp.tool()
 async def get_daily_routes_for_drivers(driver_ids: list[int], date: Optional[str] = None) -> dict:
-    """Get the routes of several drivers for one date in a single call."""
+    """Summaries of several drivers' routes for one date in a single call."""
     return await _bulk(driver_ids, lambda d: get_driver_route_summary(driver_id=d, date=date))
 
 
 @mcp.tool()
 async def optimize_daily_route(driver_id: int, date: Optional[str] = None) -> dict:
-    """Optimize a driver's route for a date (defaults to today)."""
+    """Optimize a driver's route for a date (defaults to today). Changes stop order —
+    confirm with the user first."""
     d = _date(date)
-    return await _request(
+    res = await _request(
         "POST",
         f"drivers/{driver_id}/optimize_daily_route",
         json_body={"date": d} if d else None,
     )
-
-
-@mcp.tool()
-async def optimize_routes_for_drivers(driver_ids: list[int], date: Optional[str] = None) -> dict:
-    """Optimize the routes of several drivers for one date."""
-    return await _bulk(driver_ids, lambda d: optimize_daily_route(driver_id=d, date=date))
-
-
-@mcp.tool()
-async def list_routes(date: Optional[str] = None, response_format: str = "json") -> dict:
-    """List all routes for a date (defaults to today). `response_format`: json or xml."""
-    return await _request(
-        "GET", "routes", params={"date": _date(date), "format": response_format}
-    )
-
-
-@mcp.tool()
-async def get_routes_summary(date: Optional[str] = None) -> dict:
-    """Overview of all routes for a date with a status breakdown across every stop —
-    good for 'how is today going?' questions."""
-    res = await list_routes(date=date)
-    if res.get("ok"):
-        counts: dict[str, int] = {}
-        _collect_statuses(res.get("data"), counts)
-        data = res.get("data")
-        routes = data.get("routes", data) if isinstance(data, dict) else data
-        res["route_count"] = len(routes) if isinstance(routes, list) else None
-        res["status_summary"] = counts
+    if res.get("ok") and _routes_from(res.get("data")):
+        return _routes_overview(res, include_stops=False)
     return res
 
 
 @mcp.tool()
+async def optimize_routes_for_drivers(driver_ids: list[int], date: Optional[str] = None) -> dict:
+    """Optimize the routes of several drivers for one date. Confirm with the user first."""
+    return await _bulk(driver_ids, lambda d: optimize_daily_route(driver_id=d, date=date))
+
+
+@mcp.tool()
+async def list_routes(
+    date: Optional[str] = None, full: bool = False, response_format: str = "json"
+) -> dict:
+    """List all routes for a date (defaults to today) with a compact list of every
+    stop (who, where, status, ETA). full=True returns LionWheel's raw response
+    (very large); response_format "xml" implies full."""
+    if full or response_format.lower() != "json":
+        return await _request(
+            "GET", "routes", params={"date": _date(date), "format": response_format}
+        )
+    return _routes_overview(await _fetch_routes(date), include_stops=True)
+
+
+@mcp.tool()
+async def get_routes_summary(date: Optional[str] = None) -> dict:
+    """Overview of all routes for a date — per route: driver, stops done/remaining,
+    status breakdown, distance, ETA, late and failed stops; plus day totals.
+    Best tool for 'how is today going?'."""
+    return _routes_overview(await _fetch_routes(date), include_stops=False)
+
+
+@mcp.tool()
 async def get_routes_for_date_range(start_date: str, end_date: str) -> dict:
-    """List routes for every day between two dates (inclusive, max 31 days)."""
+    """Route summaries for every day between two dates (inclusive, max 31 days)."""
     s = dt.datetime.strptime(_date(start_date), "%d/%m/%Y").date()
     e = dt.datetime.strptime(_date(end_date), "%d/%m/%Y").date()
     if e < s:
@@ -757,7 +853,14 @@ async def get_routes_for_date_range(start_date: str, end_date: str) -> dict:
     days = [(s + dt.timedelta(days=i)).strftime("%d/%m/%Y") for i in range((e - s).days + 1)]
     if len(days) > 31:
         return {"ok": False, "error": "Range too long (max 31 days)."}
-    return await _bulk(days, lambda d: get_routes_summary(date=d))
+
+    async def one(d: str) -> dict:
+        res = await get_routes_summary(date=d)
+        if res.get("ok"):  # keep the range view small: drop per-route failed stop lists
+            for r in res.get("routes", []):
+                r["failed_stops"] = len(r.get("failed_stops", []))
+        return res
+    return await _bulk(days, one)
 
 
 # --------------------------------------------------------------------------- #
